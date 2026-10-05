@@ -96,6 +96,7 @@ module Wflow
         # Compute average values
         avg = combine(groupby(flw_data,time), obs => mean => obs)
         
+        t1,t2 = nothing, nothing
         try
             scale = tcut(avg,obs=obs,time=time)(sref)
             idx = searchsortedfirst(avg[:,time], scale)
@@ -105,10 +106,6 @@ module Wflow
             @warn("Flow does not get to $sref. Extrapolating, might be very far off...")
         end
         
-        # Find closest flow times in vector
-        idx = searchsortedfirst(avg[:,time], scale)
-        t1,t2 = avg[:,time][(idx-1):idx]
-
         return t1, t2
     end
 
@@ -199,14 +196,14 @@ module Wflow
     #     res = optimize( α->mean((α.*q .- round.(α.*q)).^2), [Z0])
     #     return Optim.minimizer(res)
     # end
-    function find_Z(q::AbstractArray{Float64}; Z0=1.1)
-        res = optimize( 
-            Z->mean((Z.*q .- round.(Z.*q)).^2), 
-            [1.], [2.], [Z0],
-            Fminbox(NelderMead())
-        )
-        return Optim.minimizer(res) |> only
-    end
+function find_Z(q::AbstractArray{Float64}; Z0=1.1)
+    res = optimize( 
+        Z->mean((Z.*q .- round.(Z.*q)).^2), 
+        [1.], [2.], [Z0],
+        Fminbox(NelderMead())
+    )
+    return Optim.minimizer(res) |> only
+end
 
 
     # function Qtop(df::DataFrame, tcut::Float64; alpha=nothing)
