@@ -35,7 +35,7 @@ module Wflow
     # Returns
     - `DataFrame`: New dataframe with `uwreal` converted observations and corresponding flow times
     """
-    function uwflow(df::DataFrame, args...; obs=:t2Esym, time=:flowt)
+    function uwflow(df::D, args...; obs=:t2Esym, time=:flowt) where D<:AbstractDataFrame
         aux = DataFrame(flowt=Float64[], measure=[])
         for flw in groupby(df,time)
             t = flw[:,time][1]
@@ -92,7 +92,7 @@ module Wflow
     # Returns
     - `Tuple{Float64, Float64}`: Lower and upper flow time bounds (t1, t2)
     """
-    function tbounds(flw_data::DataFrame, sref::Float64; obs=:t2Esym, time=:flowt)
+    function tbounds(flw_data::D, sref::Float64; obs=:t2Esym, time=:flowt)  where D<:AbstractDataFrame
         # Compute average values
         avg = combine(groupby(flw_data,time), obs => mean => obs)
         
@@ -149,7 +149,7 @@ module Wflow
     # Returns
     - `uwreal`: The interpolated scale at the reference value with uncertainties
     """
-    function uwscale(flw_data::DataFrame, sref::Float64, uwargs...; obs=:t2Esym, time=:flowt)
+    function uwscale(flw_data::D, sref::Float64, uwargs...; obs=:t2Esym, time=:flowt)  where D<:AbstractDataFrame
         (t1,t2) = tbounds(flw_data,sref; obs=obs,time=time)      
         
         E1 = flw_data[flw_data[:,time] .== t1,obs]
