@@ -1,220 +1,215 @@
 """
-The basic input for this module is a `DataFrame` object that will be passed as argument to most of the functions in the modules. Such an object must look like:
+    Wflow
+
+Scale setting and flow-time interpolation on gradient-flow data held in a
+long-format `DataFrame`, one row per (configuration, flow time):
 
 ```
 2004002×5 DataFrame
-     Row │ itraj  flowt    t2Eplq      t2Esym       qtop      
-         │ Int64  Float64  Float64     Float64      Float64   
+     Row │ itraj  flowt    t2Eplq      t2Esym       qtop
+         │ Int64  Float64  Float64     Float64      Float64
 ─────────┼────────────────────────────────────────────────────
        1 │    20     0.0   0.0         0.0          -0.733137
        2 │    20     0.01  0.00133921  0.000195178  -1.48943
-       3 │    20     0.02  0.00493909  0.000762703  -1.71782
     ⋮    │   ⋮       ⋮         ⋮            ⋮           ⋮
- 2004000 │ 20020    19.99  2.52216     2.46213      -1.92395
- 2004001 │ 20020    20.0   2.52345     2.4634       -1.92398
  2004002 │ 20020    20.01  2.52473     2.46468      -1.92402
 ```
 
-It can be obtained as the output of the function `IO_*.get_flow_data`.
+Column names are not fixed: every function takes the observable (`obs`) and
+flow-time (`time` / `t`) columns as keywords. The defaults match the layout
+above, as produced by `IO_*.get_flow_data`.
+
+Error analysis uses ADerrors. Functions that build `uwreal`s take `uwargs...`,
+forwarded to `uwreal(data, uwargs...)`, i.e. `(id,)` or `(id, replica_lengths)`.
+The data at each flow time are passed in replica order: rows are sorted by
+`order` (default: whichever of `:irep`, `:itraj` are present) before the
+`uwreal` is built, so the replica lengths in `uwargs` line up with the data.
 """
 module Wflow
-    using DataFrames, ProgressMeter,ADerrors, Optim, Statistics, StatsBase
+    using DataFrames, ProgressMeter, ADerrors, Optim, Statistics, StatsBase
 
-    """
-        uwflow(df::DataFrame, args...; obs=:t2Esym, time=:flowt)
 
-    Groups data by flow time, converts observation values to `uwreal` objects, and returns
-    a new DataFrame with the converted values.
+    #---- internal helpers ---------------------------------------------------#
 
-    # Arguments
-    - `df::DataFrame`: Input dataframe containing flow time and observation columns
-    - `args...`: Additional arguments passed to `uwreal` function
-    - `obs::Symbol`: Column name of the observable to convert (default: `:t2Esym`)
-    - `time::Symbol`: Column name of the flow time (default: `:flowt`)
+    # Sort keys that put rows in replica order: `order` if given, otherwise
+    # whichever of :irep, :itraj the DataFrame has (old single-replica frames
+    # have only :itraj).
+    _order(d::AbstractDataFrame, order) =
+        isnothing(order) ? intersect([:irep, :itraj], propertynames(d)) : order
 
-    # Returns
-    - `DataFrame`: New dataframe with `uwreal` converted observations and corresponding flow times
-    """
-    function uwflow(df::D, args...; obs=:t2Esym, time=:flowt) where D<:AbstractDataFrame
-        aux = DataFrame(flowt=Float64[], measure=[])
-        for flw in groupby(df,time)
-            t = flw[:,time][1]
-            t2E = uwreal(flw[:,obs],args...)
-            push!(aux, (t, t2E))
-        end
-
-        rename!(aux, :measure => obs)
-        rename!(aux, :flowt => time)
-        return aux
+    # Column `obs` at flow time `tt` (exact grid value), one entry per
+    # configuration, in replica order — ready to be passed to `uwreal`.
+    function _column_at(d::AbstractDataFrame, t, tt, obs, order)
+        rows = d[d[!, t] .== tt, :]
+        o    = _order(d, order)
+        isempty(o) || sort!(rows, o)
+        return Vector{Float64}(rows[!, obs])
     end
 
+
+    #---- scale setting ------------------------------------------------------#
+
     """
-        tcut(df; obs=:t2Esym)
+        tcut(df, sref; obs=:t2Esym, time=:flowt)
 
-    Returns a function that performs linear interpolation to find the flow time corresponding 
-    to a given observable reference value.
+    Flow time at which `obs` crosses `sref`, by linear interpolation between the
+    last row below and the first row above `sref`:
 
-    # Arguments
-    - `df::DataFrame`: Dataframe containing observable and flow time columns
-    - `obs::Symbol`: Column name of the observable (default: `:t2Esym`)
+        t* = t₁ + (sref - y₁) (t₂ - t₁) / (y₂ - y₁)
 
-    # Returns
-    - `Function`: A function `sref -> Float64` that takes a reference value and returns interpolated flow time
+    Works on plain numbers: `df` should hold one value per flow time (typically
+    the Monte Carlo average, see `tbounds`), sorted by `time`, with `obs`
+    monotonically increasing across `sref` (true for t²E and its derivatives).
+
+    Throws a `BoundsError` if no row lies above (or below) `sref`.
     """
-    tcut(df; obs=:t2Esym, time=:flowt) = sref -> begin
+    function tcut(df::DF, sref::T; obs=:t2Esym, time=:flowt) where {DF<:AbstractDataFrame, T<:AbstractFloat}
+        # first point above sref
         y2 = df[df[:,obs] .> sref, :][1,obs]
         t2 = df[df[:,obs] .> sref, :][1,time]
 
+        # last point below sref
         y1 = df[df[:,obs] .< sref, :][end,obs]
         t1 = df[df[:,obs] .< sref, :][end,time]
 
+        # straight line through (t1,y1), (t2,y2), solved for y = sref
         m = (y2-y1)/(t2-t1)
         q = y1 - m*t1
-        
+
         return (sref - q)/m
     end
 
-    """
-        tbounds(flw_data::DataFrame, sref::Float64; obs=:t2Esym)
-
-    Determines the flow time bounds that bracket the reference value by computing
-    the average observable across trajectories and performing interpolation.
-
-    In case the average of `flw_data[:,obs]` does not get to `sref`, the returned 
-    flow times are the last two available. A warning message gets printed. 
-
-    # Arguments
-    - `flw_data::DataFrame`: Dataframe containing flow data with multiple trajectories
-    - `sref::Float64`: Reference observable value
-    - `obs::Symbol`: Column name of the observable (default: `:t2Esym`)
-    - `time::Symbol`: Column name of the flow time (default: `:flowt`)
-
-    # Returns
-    - `Tuple{Float64, Float64}`: Lower and upper flow time bounds (t1, t2)
-    """
-    function tbounds(flw_data::D, sref::Float64; obs=:t2Esym, time=:flowt)  where D<:AbstractDataFrame
-        # Compute average values
-        avg = combine(groupby(flw_data,time), obs => mean => obs)
-        
-        t1,t2 = nothing, nothing
-        try
-            scale = tcut(avg,obs=obs,time=time)(sref)
-            idx = searchsortedfirst(avg[:,time], scale)
-            t1,t2 = avg[:,time][(idx-1):idx]
-        catch BoundsError
-            t1,t2 = avg[:,time][end-1:end]
-            @warn("Flow does not get to $sref. Extrapolating, might be very far off...")
-        end
-        
-        return t1, t2
-    end
 
     """
-    confid(flw_data; offset=true)
+        tbounds(flw_data, sref; obs=:t2Esym, time=:flowt)
 
-    Extracts and optionally adjusts trajectory identifiers for confidence interval calculations.
+    The two grid flow times `(t₁, t₂)` bracketing the crossing ⟨obs⟩(t) = sref,
+    where ⟨obs⟩ is the average over configurations at each flow time.
 
-    # Arguments
-    - `flw_data::DataFrame`: Dataframe containing trajectory column `:itraj`
-    - `offset::Boolean`: If true, shifts trajectory indices to start from a non-zero value (default: true)
-
-    # Returns
-    - `Vector{Int64}`: Trajectory identifiers as Int64 values
+    Only central values are used here; this selects *which* flow times enter the
+    error analysis in `uwscale`. If the flow never reaches `sref`, the last two
+    flow times are returned with a warning, and `uwscale` then extrapolates.
+    Errors if ⟨obs⟩ is already above `sref` at the first flow time.
     """
-    function confid(flw_data; offset=false)
-        trajs = unique(flw_data.itraj)
+    function tbounds(flw_data::DF, sref::T; obs=:t2Esym, time=:flowt) where {DF<:AbstractDataFrame, T<:AbstractFloat}
+        # Monte Carlo average per flow time, sorted in flow time
+        avg = sort(combine(groupby(flw_data, time), obs => mean => obs), time)
+        tt, yy = avg[!, time], avg[!, obs]
 
-        if offset
-            trajs .-= trajs[1] # Subtract the first element
-            trajs .+= trajs[2] # Add the second element to start form not zero
+        first(yy) < sref ||
+            error("⟨$(obs)⟩ = $(first(yy)) is already above sref = $(sref) at the first flow time $(first(tt))")
+
+        if last(yy) ≤ sref
+            @warn("Flow does not get to $sref (max ⟨$(obs)⟩ = $(last(yy))). " *
+                  "Extrapolating from the last two flow times, might be very far off...")
+            return tt[end-1], tt[end]
         end
 
-        # trajs = Int64.(trajs) .// gcd(trajs)
-        return Int64.(trajs)
+        # central crossing point, then the grid points on either side of it
+        scale = tcut(avg, sref; obs=obs, time=time)
+        idx   = searchsortedfirst(tt, scale)
+        return tt[idx-1], tt[idx]
     end
-    
+
+
     """
-        uwscale(flw_data::DataFrame, sref::Float64, uwargs...; obs=:t2Esym, time=:flowt)
+        uwscale(flw_data, sref, uwargs...; obs=:t2Esym, time=:flowt, order=nothing)
 
-    Computes a scaled observable value at the reference point using linear interpolation 
-    between two bracketing flow times with proper uncertainty propagation.
+    Reference flow time (e.g. t₀/a² for `obs = t²E`, `sref = 0.3`) as a `uwreal`.
 
-    # Arguments
-    - `flw_data::DataFrame`: Dataframe containing flow data
-    - `sref::Float64`: Reference observable value
-    - `uwargs::Tuple`: Tuple of arguments passed to `uwreal` to compute ref scale
-    - `obs::Symbol`: Column name of the observable (default: `:t2Esym`)
-    - `time::Symbol`: Column name of the flow time (default: `:flowt`)
+    The two flow times bracketing the crossing are chosen from central values
+    (`tbounds`); at those, `obs` is promoted to primary observables y₁, y₂ and
 
-    # Returns
-    - `uwreal`: The interpolated scale at the reference value with uncertainties
+        t_ref = (sref - q) / m,    m = (y₂ - y₁)/(t₂ - t₁),  q = y₁ - m t₁
+
+    so the error and the correlation between y₁ and y₂ are propagated exactly.
     """
-    function uwscale(flw_data::D, sref::Float64, uwargs...; obs=:t2Esym, time=:flowt)  where D<:AbstractDataFrame
-        (t1,t2) = tbounds(flw_data,sref; obs=obs,time=time)      
-        
-        E1 = flw_data[flw_data[:,time] .== t1,obs]
-        E2 = flw_data[flw_data[:,time] .== t2,obs]
+    function uwscale(flw_data::D, sref::Float64, uwargs...; obs=:t2Esym, time=:flowt, order=nothing) where D<:AbstractDataFrame
+        (t1, t2) = tbounds(flw_data, sref; obs=obs, time=time)
 
-        y1 = uwreal(E1,uwargs...)
-        y2 = uwreal(E2,uwargs...)
+        # per-configuration values at the bracketing flow times, in replica order
+        y1 = uwreal(_column_at(flw_data, time, t1, obs, order), uwargs...)
+        y2 = uwreal(_column_at(flw_data, time, t2, obs, order), uwargs...)
 
         m = (y2-y1)/(t2-t1)
         q = y1 - m*t1
-        
+
         return (sref - q)/m
+    end
+
+
+    #---- evaluating observables at a given flow time ------------------------#
+
+    """
+        interpolate_at(d, tx, uwargs...; obs=:q, t=:flowt, order=nothing)
+
+    ⟨obs⟩ at flow time `tx` by linear interpolation between the two grid flow
+    times bracketing it, `ta ≤ tx < tb`:
+
+        ⟨obs⟩(tx) = y_a + (tx - t_a) (y_b - y_a) / (t_b - t_a)
+
+    with y_a, y_b primary observables built from the configurations at t_a, t_b.
+
+    `tx` can be a `uwreal` (e.g. `r * t0` from `uwscale`): the brackets use its
+    central value and the interpolation uses `tx` itself, so its error and its
+    correlation with `obs` (same configurations) are propagated.
+    """
+    function interpolate_at(d::AbstractDataFrame, tx::Union{AbstractFloat,uwreal}, uwargs...;
+                            obs=:q, t=:flowt, order=nothing)
+        tv    = tx isa uwreal ? value(tx) : tx
+        tflow = sort(unique(d[!, t]))
+        i     = searchsortedlast(tflow, tv)
+        1 ≤ i < length(tflow) ||
+            error("flow time $(tv) outside the grid [$(first(tflow)), $(last(tflow))]")
+        ta, tb = tflow[i], tflow[i+1]
+
+        ya = uwreal(_column_at(d, t, ta, obs, order), uwargs...)
+        yb = uwreal(_column_at(d, t, tb, obs, order), uwargs...)
+
+        return ya + (tx - ta) * (yb - ya) / (tb - ta)
     end
 
 
     """
         slice_at(df, t0; time=:flowt)
 
-    Extracts a subset of the dataframe corresponding to the flow time closest to the 
-    specified target value t0.
-
-    # Arguments
-    - `df::DataFrame`: Input dataframe containing a flow time column
-    - `t0::Float64`: Target flow time value
-    - `time::Symbol`: Column name of the flow time (default: `:flowt`)
-
-    # Returns
-    - `SubDataFrame`: Subset of the input dataframe at the nearest flow time to t0
+    The rows of `df` at the grid flow time closest to `t0`, as a `SubDataFrame`
+    (a view; no copy). No interpolation: use `interpolate_at` when the
+    observable is needed exactly at `t0`, or when `t0` carries an error.
     """
-    function slice_at(df, t0; time=:flowt)
-        # Extract unique flow time values
-        tflow = unique(df[:, time])
-        
-        # Find index of flow time closest to target value
-        it0 = argmin(abs.(tflow .- t0))
-        
-        # Return grouped data at the identified flow time
-        return groupby(df, time)[it0]
+    function slice_at(df, t0::T; time=:flowt) where T<:AbstractFloat
+        tflow = unique(df[!, time])
+        tnear = tflow[argmin(abs.(tflow .- t0))]   # nearest grid flow time
+        return view(df, df[!, time] .== tnear, :)
     end
 
 
+    #---- topological charge -------------------------------------------------#
 
-    # function find_Z(q::AbstractArray{Float64}; Z0=0.7)
-    #     res = optimize( α->mean((α.*q .- round.(α.*q)).^2), [Z0])
-    #     return Optim.minimizer(res)
-    # end
-function find_Z(q::AbstractArray{Float64}; Z0=1.1)
-    res = optimize( 
-        Z->mean((Z.*q .- round.(Z.*q)).^2), 
-        [1.], [2.], [Z0],
-        Fminbox(NelderMead())
-    )
-    return Optim.minimizer(res) |> only
-end
+    """
+        find_Z(q; Z0=1.1)
+
+    Multiplicative factor Z ∈ [1, 2] that brings the per-configuration charges
+    `q` closest to integers, by minimising
+
+        f(Z) = mean_k (Z q_k - round(Z q_k))²
+
+    with box-constrained Nelder–Mead started at `Z0`. f is piecewise smooth with
+    many local minima, so the result depends on `Z0`; check it against a scan of
+    f(Z) if in doubt. Meaningful only at flow times where the charge
+    distribution already shows peaks near integers.
+    """
+    function find_Z(q::AbstractArray{Float64}; Z0=1.1)
+        res = optimize(
+            Z->mean((Z.*q .- round.(Z.*q)).^2),
+            [1.], [2.], [Z0],
+            Fminbox(NelderMead())
+        )
+        return Optim.minimizer(res) |> only
+    end
 
 
-    # function Qtop(df::DataFrame, tcut::Float64; alpha=nothing)
-    #     α = isnothing(alpha) ? find_optimal_alpha(df,tcut) : alpha
-    #     aux = slice_at(df,tcut)[:,[:itraj,:qtop]]
-    #     aux.qtop_round = round.(α .* aux.qtop)
-    #     return aux
-    # end
+    export tcut, tbounds, uwscale
+    export slice_at, interpolate_at, find_Z
 
-
-    export uwflow, tcut, tbounds, uwscale, confid
-    export slice_at, find_Z
-    
 end

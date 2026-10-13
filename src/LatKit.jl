@@ -22,8 +22,8 @@ module LatKit
     
     include("Wflow.jl")
         using .Wflow
-        export uwflow, tcut, tbounds, uwscale, confid
-        export slice_at, find_Z
+        export tcut, tbounds, uwscale
+        export slice_at, interpolate_at, find_Z
 
     include("LatKit_fits.jl")
         export line, parabola, χ², uwfit
