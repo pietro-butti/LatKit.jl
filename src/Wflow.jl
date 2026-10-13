@@ -83,44 +83,54 @@ module Wflow
     """
         tbounds(flw_data, sref; obs=:t2Esym, time=:flowt)
 
-    The two grid flow times `(t₁, t₂)` closest to the crossing ⟨obs⟩(t*) = sref,
+    Returns the two grid flow times `(t₁, t₂)` closest to t*, defined by ⟨obs⟩(t*) = sref,
     where ⟨obs⟩ is the average over configurations at each flow time.
 
-    Only central values are used here; this selects *which* flow times enter the
-    error analysis in `uwscale`. If t* lies outside [t₁, t₂], `uwscale` extrapolates
-    and a warning reports the extrapolation distance. If the flow never reaches
-    `sref`, the last two flow times are returned with a warning.
-    Errors if ⟨obs⟩ is already above `sref` at the first flow time.
+    t* is found with `tcut` if the flow crosses `sref`, and otherwise by linear
+    extrapolation from the last two flow times. Only central values are used here;
+    this selects *which* flow times enter the error analysis in `uwscale`.
+
+    If t* ∉ [t₁, t₂], `uwscale` extrapolates linearly, which is only reliable for
+    small Δt = dist(t*, [t₁, t₂]). A warning then reports Δt in two forms:
+    - Δt/(t₂-t₁): extrapolation distance in units of the lever arm of the two points;
+    - Δt/t*: the more physical measure, since flow observables vary on a scale
+    set by t itself (smoothing radius √(8t)).
+
+    Errors if ⟨obs⟩ is already above `sref` at the first flow time, or if ⟨obs⟩ is
+    not increasing at the last two flow times when extrapolation is needed.
     """
     function tbounds(flw_data::DF, sref::T; obs=:t2Esym, time=:flowt) where {DF<:AbstractDataFrame, T<:AbstractFloat}
+        # Monte Carlo average per flow time, sorted in flow time
         avg = sort(combine(groupby(flw_data, time), obs => mean => obs), time)
         tt, yy = avg[!, time], avg[!, obs]
 
+        length(tt) ≥ 2 || error("Need at least two flow times, got $(length(tt))")
         first(yy) < sref ||
             error("⟨$(obs)⟩ = $(first(yy)) is already above sref = $(sref) at the first flow time $(first(tt))")
 
-        if last(yy) ≤ sref
-            @warn("Flow does not get to $sref (max ⟨$(obs)⟩ = $(last(yy))). " *
-                "Extrapolating from the last two flow times, might be very far off...")
-            return tt[end-1], tt[end]
+        # central crossing point: interpolated if the flow reaches sref, extrapolated otherwise
+        ts = if last(yy) > sref
+            tcut(avg, sref; obs=obs, time=time)
+        else
+            dy = yy[end] - yy[end-1]
+            dy > 0 ||
+                error("⟨$(obs)⟩ not increasing at the last two flow times; cannot extrapolate to sref = $(sref)")
+            tt[end] + (sref - yy[end]) * (tt[end] - tt[end-1]) / dy
         end
 
-        # central crossing point (from the bracketing pair)
-        ts = tcut(avg, sref; obs=obs, time=time)
-
-        # two grid points closest to t* — always adjacent on a sorted grid
+        # two grid points closest to t* (always adjacent on a sorted grid)
         i, j = sort(partialsortperm(abs.(tt .- ts), 1:2))
         t1, t2 = tt[i], tt[j]
 
         if !(t1 ≤ ts ≤ t2)
-            Δ = min(abs(ts - t1), abs(ts - t2))
-            @warn("t* ≈ $ts lies outside the closest pair ($t1, $t2): extrapolating by " *
-                "Δt = $Δ (Δt/(t₂-t₁) = $(Δ/(t2 - t1)), Δt/t* = $(Δ/ts)). " *
-                "Linear extrapolation may be inaccurate.")
+            Δ  = min(abs(ts - t1), abs(ts - t2))
+            r3 = x -> round(x; sigdigits=3)
+            @warn("t* ≈ $(r3(ts)) lies outside the closest pair ($t1, $t2): extrapolating by " *
+                "Δt = $(r3(Δ)), i.e. Δt/(t₂-t₁) = $(r3(Δ/(t2 - t1))), Δt/t* = $(r3(Δ/ts)). " *
+                "Linear extrapolation is only reliable for small Δt.")
         end
         return t1, t2
     end
-
 
 
     """
