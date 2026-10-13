@@ -83,16 +83,16 @@ module Wflow
     """
         tbounds(flw_data, sref; obs=:t2Esym, time=:flowt)
 
-    The two grid flow times `(t₁, t₂)` bracketing the crossing ⟨obs⟩(t) = sref,
+    The two grid flow times `(t₁, t₂)` closest to the crossing ⟨obs⟩(t*) = sref,
     where ⟨obs⟩ is the average over configurations at each flow time.
 
     Only central values are used here; this selects *which* flow times enter the
-    error analysis in `uwscale`. If the flow never reaches `sref`, the last two
-    flow times are returned with a warning, and `uwscale` then extrapolates.
+    error analysis in `uwscale`. If t* lies outside [t₁, t₂], `uwscale` extrapolates
+    and a warning reports the extrapolation distance. If the flow never reaches
+    `sref`, the last two flow times are returned with a warning.
     Errors if ⟨obs⟩ is already above `sref` at the first flow time.
     """
     function tbounds(flw_data::DF, sref::T; obs=:t2Esym, time=:flowt) where {DF<:AbstractDataFrame, T<:AbstractFloat}
-        # Monte Carlo average per flow time, sorted in flow time
         avg = sort(combine(groupby(flw_data, time), obs => mean => obs), time)
         tt, yy = avg[!, time], avg[!, obs]
 
@@ -101,15 +101,26 @@ module Wflow
 
         if last(yy) ≤ sref
             @warn("Flow does not get to $sref (max ⟨$(obs)⟩ = $(last(yy))). " *
-                  "Extrapolating from the last two flow times, might be very far off...")
+                "Extrapolating from the last two flow times, might be very far off...")
             return tt[end-1], tt[end]
         end
 
-        # central crossing point, then the grid points on either side of it
-        scale = tcut(avg, sref; obs=obs, time=time)
-        idx   = searchsortedfirst(tt, scale)
-        return tt[idx-1], tt[idx]
+        # central crossing point (from the bracketing pair)
+        ts = tcut(avg, sref; obs=obs, time=time)
+
+        # two grid points closest to t* — always adjacent on a sorted grid
+        i, j = sort(partialsortperm(abs.(tt .- ts), 1:2))
+        t1, t2 = tt[i], tt[j]
+
+        if !(t1 ≤ ts ≤ t2)
+            Δ = min(abs(ts - t1), abs(ts - t2))
+            @warn("t* ≈ $ts lies outside the closest pair ($t1, $t2): extrapolating by " *
+                "Δt = $Δ (Δt/(t₂-t₁) = $(Δ/(t2 - t1)), Δt/t* = $(Δ/ts)). " *
+                "Linear extrapolation may be inaccurate.")
+        end
+        return t1, t2
     end
+
 
 
     """
